@@ -19,7 +19,12 @@ from .tui.terminal import configure_text_streams, is_interactive_terminal
 def create_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_COMMAND,
-        description="%s：用于清理 Claude 本地数据的备份安全工具。" % APP_DISPLAY_NAME,
+        description=(
+            "%s：用于清理 Claude 本地数据的备份安全工具。"
+            " 直接运行 `cc-clean` 或使用 `tui` 子命令进入交互界面；"
+            " `plan` / `clean` / `remap-history` 是纯文本 CLI 流程。"
+        )
+        % APP_DISPLAY_NAME,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     _add_home_arg(parser)
@@ -30,11 +35,15 @@ def create_arg_parser() -> argparse.ArgumentParser:
     _add_home_arg(list_parser)
     list_parser.set_defaults(command="list-targets")
 
-    plan_parser = subparsers.add_parser("plan", help="预览清理计划。")
+    tui_parser = subparsers.add_parser("tui", help="启动交互式 TUI（带 logo 和键盘操作）。")
+    _add_home_arg(tui_parser)
+    tui_parser.set_defaults(command="tui")
+
+    plan_parser = subparsers.add_parser("plan", help="以纯文本 CLI 方式预览清理计划。")
     _add_home_arg(plan_parser)
     _add_selection_args(plan_parser)
 
-    clean_parser = subparsers.add_parser("clean", help="执行清理操作。")
+    clean_parser = subparsers.add_parser("clean", help="以纯文本 CLI 方式执行清理操作。")
     _add_home_arg(clean_parser)
     _add_selection_args(clean_parser)
     clean_parser.add_argument("--yes", action="store_true", help="跳过确认提示。")
@@ -78,6 +87,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for key in target_keys():
             print(key)
         return 0
+
+    if args.command == "tui":
+        if not is_interactive_terminal():
+            print("TUI 需要交互终端。请直接在终端中运行，或改用 `plan` / `clean` 纯文本命令。")
+            return 1
+        return run_tui(paths)
 
     if args.command == "remap-history":
         backup_root = Path(args.backup_root).expanduser() if args.backup_root else None

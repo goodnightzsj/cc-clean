@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cc_clean.cli import main as cli_main
 from cc_clean.history_remap import remap_history_identifiers
 from cc_clean.models import RunOptions
 from cc_clean.paths import default_paths
@@ -202,6 +203,32 @@ class CleanupWorkflowTests(unittest.TestCase):
                 app._leave_terminal()
 
             self.assertEqual(buffer.getvalue(), "ENTEREXIT")
+
+    def test_cli_tui_subcommand_launches_interactive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("cc_clean.cli.is_interactive_terminal", return_value=True):
+                with patch("cc_clean.cli.run_tui", return_value=7) as mocked_run_tui:
+                    code = cli_main(["tui", "--home", tmp_dir])
+
+        self.assertEqual(code, 7)
+        mocked_run_tui.assert_called_once()
+        called_paths = mocked_run_tui.call_args.args[0]
+        self.assertEqual(called_paths.home, Path(tmp_dir))
+
+    def test_cli_plan_subcommand_stays_in_plain_text_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = default_paths(home)
+            paths.claude_dir.mkdir(parents=True)
+            paths.state_file.write_text(json.dumps({"userID": "abc"}), encoding="utf-8")
+            buffer = io.StringIO()
+            with patch("sys.stdout", buffer):
+                with patch("cc_clean.cli.run_tui") as mocked_run_tui:
+                    code = cli_main(["plan", "--home", tmp_dir])
+
+        self.assertEqual(code, 0)
+        self.assertIn("CC Clean 计划", buffer.getvalue())
+        mocked_run_tui.assert_not_called()
 
     def test_remap_history_rewrites_only_structured_identifier_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
