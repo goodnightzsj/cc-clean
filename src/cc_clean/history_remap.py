@@ -84,7 +84,7 @@ def remap_history_identifiers(
         )
         return ExecutionSummary(records=tuple(records), backup_root=None)
 
-    for file_path in _iter_candidate_files(_rewrite_roots(paths), paths.home):
+    for file_path in _iter_candidate_files(_rewrite_roots(paths), (paths.home, paths.claude_dir)):
         outcome = _transform_file(file_path, mappings)
         change_count = outcome[1] if outcome is not None else 0
         if change_count == 0:
@@ -341,19 +341,29 @@ def _rewrite_roots(paths: ClaudePaths) -> Tuple[Path, ...]:
     )
 
 
-def _iter_candidate_files(roots: Iterable[Path], home: Path) -> Iterator[Path]:
+def _iter_candidate_files(roots: Iterable[Path], allowed_bases: Iterable[Path]) -> Iterator[Path]:
     seen = set()
-    try:
-        home_resolved = home.resolve()
-    except OSError:
-        home_resolved = home
+    # Resolve the allowed-base prefixes once. We allow both $HOME and the
+    # resolved ~/.claude — if the user symlinks ~/.claude elsewhere (a common
+    # setup, e.g. onto a synced drive), files under it resolve outside $HOME but
+    # are still legitimately in scope; the protection that matters is against an
+    # *individual project dir* being a symlink into an unrelated tree, which the
+    # per-child is_symlink()/followlinks=False checks already cover.
+    resolved_bases: list[Path] = []
+    for base in allowed_bases:
+        try:
+            resolved_bases.append(base.resolve())
+        except OSError:
+            resolved_bases.append(base)
 
     def _under_home(resolved: Path) -> bool:
-        try:
-            resolved.relative_to(home_resolved)
-            return True
-        except ValueError:
-            return False
+        for rb in resolved_bases:
+            try:
+                resolved.relative_to(rb)
+                return True
+            except ValueError:
+                continue
+        return False
 
     for root in roots:
         if not root.exists():
@@ -577,8 +587,18 @@ def _ensure_backup_root(paths: ClaudePaths, current: Optional[Path], options: Ru
         return current
     if current is not None:
         return current
+    # 0700 on the whole backup tree — remap backups contain projects/ /
+    # sessions/ / history.jsonl (conversation plaintext + userID/stableID), and
+    # if this is the first cc-clean command run, ~/.claude-clean-backups would
+    # otherwise be created world-traversable (default umask). Mirrors
+    # services._ensure_backup_root.
+    paths.backup_root_base.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(paths.backup_root_base, 0o700)
+    except OSError:
+        pass
     backup_root = paths.backup_root_base / Path("remap-%s" % _now_stamp())
-    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return backup_root
 
 

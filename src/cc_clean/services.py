@@ -340,7 +340,11 @@ def _execute_remove_path(
             backup_path=str(destination),
         )
 
-    if path.is_dir():
+    if path.is_symlink():
+        # is_dir() follows the link, so shutil.rmtree(<symlink>) raises — and
+        # the user asked to remove the *link*, not the target's contents. Unlink.
+        path.unlink()
+    elif path.is_dir():
         shutil.rmtree(path)
     else:
         path.unlink()
@@ -439,6 +443,8 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
     try:
         with os.fdopen(fd, "w", encoding=encoding) as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())  # the temp file's data must hit disk before the rename
         if path.name in _SENSITIVE_FILENAMES:
             os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
