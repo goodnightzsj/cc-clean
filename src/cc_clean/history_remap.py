@@ -84,8 +84,9 @@ def remap_history_identifiers(
         )
         return ExecutionSummary(records=tuple(records), backup_root=None)
 
-    for file_path in _iter_candidate_files(_rewrite_roots(paths)):
-        change_count = _inspect_rewrite_count(file_path, mappings)
+    for file_path in _iter_candidate_files(_rewrite_roots(paths), paths.home):
+        outcome = _transform_file(file_path, mappings)
+        change_count = outcome[1] if outcome is not None else 0
         if change_count == 0:
             continue
 
@@ -108,7 +109,7 @@ def remap_history_identifiers(
         else:
             backup_path = None
 
-        _rewrite_file_in_place(file_path, mappings)
+        atomic_write_text(file_path, outcome[0])
         records.append(
             ExecutionRecord(
                 key=str(file_path),
@@ -150,9 +151,18 @@ def load_old_identifier_snapshot(
         candidates.append(Path(backup_root_hint).expanduser())
 
     if paths.backup_root_base.exists():
-        for child in sorted(paths.backup_root_base.iterdir(), reverse=True):
-            if child.is_dir():
-                candidates.append(child)
+        # Order by mtime, newest first — a lexical sort would rank a
+        # "remap-YYYYMMDD-HHMMSS" dir above every bare-timestamp clean backup
+        # ('r' > '2') regardless of actual age.
+        def _mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        dirs = [c for c in paths.backup_root_base.iterdir() if c.is_dir()]
+        for child in sorted(dirs, key=_mtime, reverse=True):
+            candidates.append(child)
 
     for candidate in candidates:
         snapshot = _load_identifier_snapshot(candidate / ".claude.json", candidate / ".claude" / "statsig")
@@ -331,16 +341,32 @@ def _rewrite_roots(paths: ClaudePaths) -> Tuple[Path, ...]:
     )
 
 
-def _iter_candidate_files(roots: Iterable[Path]) -> Iterator[Path]:
+def _iter_candidate_files(roots: Iterable[Path], home: Path) -> Iterator[Path]:
     seen = set()
+    try:
+        home_resolved = home.resolve()
+    except OSError:
+        home_resolved = home
+
+    def _under_home(resolved: Path) -> bool:
+        try:
+            resolved.relative_to(home_resolved)
+            return True
+        except ValueError:
+            return False
+
     for root in roots:
         if not root.exists():
             continue
+        # A symlinked *root* (e.g. ~/.claude/projects -> some real git tree) is
+        # not caught by os.walk(followlinks=False), which only governs descent
+        # into child dirs — skip it explicitly so we never rewrite files that
+        # live outside the ~/.claude tree.
+        if root.is_symlink():
+            continue
         if root.is_file():
-            if root.is_symlink():
-                continue
             resolved = root.resolve()
-            if resolved in seen:
+            if resolved in seen or not _under_home(resolved):
                 continue
             seen.add(resolved)
             yield root
@@ -356,25 +382,10 @@ def _iter_candidate_files(roots: Iterable[Path]) -> Iterator[Path]:
                 if not child.is_file():
                     continue
                 resolved = child.resolve()
-                if resolved in seen:
+                if resolved in seen or not _under_home(resolved):
                     continue
                 seen.add(resolved)
                 yield child
-
-
-def _inspect_rewrite_count(path: Path, mappings: Dict[str, Tuple[str, str]]) -> int:
-    outcome = _transform_file(path, mappings)
-    return outcome[1] if outcome is not None else 0
-
-
-def _rewrite_file_in_place(path: Path, mappings: Dict[str, Tuple[str, str]]) -> None:
-    outcome = _transform_file(path, mappings)
-    if outcome is None:
-        return
-    updated_text, change_count = outcome
-    if change_count <= 0:
-        return
-    atomic_write_text(path, updated_text)
 
 
 def _transform_file(path: Path, mappings: Dict[str, Tuple[str, str]]) -> Optional[Tuple[str, int]]:
@@ -430,28 +441,35 @@ def _transform_jsonl_file(path: Path, mappings: Dict[str, Tuple[str, str]]) -> O
     except Exception:
         return None
 
-    lines = text.splitlines()
+    # Split only on "\n" — str.splitlines() also breaks on \v \f \x1c-\x1e
+    # \x85    , all of which can legally occur *inside* a JSON string
+    # value (JSON.stringify, which Claude Code uses, doesn't escape U+2028/29),
+    # so it would split one record across two physical lines and corrupt the
+    # file when we rejoin with "\n". A trailing "\n" yields a final "" element
+    # that round-trips correctly through "\n".join, preserving the newline.
+    lines = text.split("\n")
     transformed: List[str] = []
     change_count = 0
     for line in lines:
-        stripped = line.strip()
-        if not stripped:
+        carriage = line.endswith("\r")  # tolerate CRLF; the \r isn't JSON
+        core = line[:-1] if carriage else line
+        if not core.strip():
             transformed.append(line)
             continue
         try:
-            payload = json.loads(line)
+            payload = json.loads(core)
         except Exception:
             transformed.append(line)
             continue
         updated, line_changes = _rewrite_json_payload(payload, (), mappings)
         change_count += line_changes
-        transformed.append(json.dumps(updated, ensure_ascii=True))
+        rebuilt = json.dumps(updated, ensure_ascii=True)
+        transformed.append(rebuilt + "\r" if carriage else rebuilt)
 
     if change_count == 0:
         return None
 
-    suffix = "\n" if text.endswith("\n") or not transformed else ""
-    return "\n".join(transformed) + suffix, change_count
+    return "\n".join(transformed), change_count
 
 
 def _rewrite_json_payload(

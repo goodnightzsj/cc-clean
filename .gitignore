@@ -1,3 +1,10 @@
 .ace-tool/
 __pycache__/
 *.pyc
+# --- trellis local (do not commit) ---
+.trellis/
+.claude/
+.agents/
+AGENTS.md
+.codex/
+.ai/
