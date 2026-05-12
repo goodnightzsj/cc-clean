@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -306,8 +308,15 @@ def _ensure_backup_root(paths: ClaudePaths, current: Optional[Path], options: Ru
     if current is not None:
         return current
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 0700 so a backed-up .credentials.json / .claude.json isn't readable by
+    # other local users via a world-traversable backup tree.
+    paths.backup_root_base.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(paths.backup_root_base, 0o700)
+    except OSError:
+        pass
     backup_root = paths.backup_root_base / stamp
-    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return backup_root
 
 
@@ -414,8 +423,35 @@ def _load_json_dict(path: Path) -> Tuple[Optional[Dict[str, object]], List[str]]
     return payload, warnings
 
 
+_SENSITIVE_FILENAMES = {".claude.json", ".credentials.json", "settings.json"}
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write `text` to `path` atomically (temp file in the same dir → os.replace).
+
+    A crash / full disk / SIGKILL mid-write leaves the original `path` intact
+    rather than a half-truncated file (`~/.claude.json` can be megabytes).
+    Sensitive files get 0600 before being moved into place.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+        if path.name in _SENSITIVE_FILENAMES:
+            os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _write_json(path: Path, payload: Dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
 
 
 def _path_size(path: Path) -> int:

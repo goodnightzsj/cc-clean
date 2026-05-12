@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 from .models import ExecutionRecord, ExecutionSummary, RunOptions
 from .paths import ClaudePaths
-from .services import _backup_file_copy
+from .services import _backup_file_copy, atomic_write_text
 
 DEFAULT_CLAUDE_PROMPT = "Reply with a single word: ok"
 
@@ -43,7 +44,14 @@ def remap_history_identifiers(
                 )
             )
         else:
-            _run_claude_refresh(timeout_seconds=claude_timeout_seconds)
+            try:
+                _run_claude_refresh(timeout_seconds=claude_timeout_seconds)
+            except RuntimeError as exc:
+                records.append(
+                    ExecutionRecord(key="refresh_claude", status="error", message=str(exc))
+                )
+                # Don't proceed to remap with stale identifiers.
+                return ExecutionSummary(records=tuple(records), backup_root=None)
             records.append(
                 ExecutionRecord(
                     key="refresh_claude",
@@ -154,13 +162,20 @@ def load_old_identifier_snapshot(
 
 
 def _run_claude_refresh(timeout_seconds: int) -> None:
-    result = subprocess.run(
-        ["claude", "-p", DEFAULT_CLAUDE_PROMPT],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", DEFAULT_CLAUDE_PROMPT],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "运行 Claude 生成新标识超时（%ds）；可用 --claude-timeout 调大或去掉 --run-claude" % timeout_seconds
+        ) from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("找不到 `claude` 命令，请确认 Claude Code 已安装并在 PATH 中") from exc
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         stdout = (result.stdout or "").strip()
@@ -300,13 +315,18 @@ def _build_identifier_mappings(old: IdentifierSnapshot, current: IdentifierSnaps
 
 
 def _rewrite_roots(paths: ClaudePaths) -> Tuple[Path, ...]:
+    # NB: paths.backup_root_base is deliberately NOT here. That tree is this
+    # tool's own backup store — `load_old_identifier_snapshot` reads the
+    # *original* identifiers from it; rewriting it in place would make a
+    # restore irreversible, break a repeat remap, and (since each remap also
+    # backs up the files it touches *into* backup_root_base) cause unbounded
+    # nesting on the next run.
     return (
         paths.projects_dir,
         paths.sessions_dir,
         paths.history_file,
         paths.session_env_dir,
         paths.telemetry_dir,
-        paths.backup_root_base,
         paths.claude_backups_dir,
     )
 
@@ -317,20 +337,29 @@ def _iter_candidate_files(roots: Iterable[Path]) -> Iterator[Path]:
         if not root.exists():
             continue
         if root.is_file():
+            if root.is_symlink():
+                continue
             resolved = root.resolve()
             if resolved in seen:
                 continue
             seen.add(resolved)
             yield root
             continue
-        for child in root.rglob("*"):
-            if not child.is_file():
-                continue
-            resolved = child.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            yield child
+        # os.walk(followlinks=False): don't descend into symlinked dirs and
+        # don't rewrite symlinked files — that could touch files outside the
+        # ~/.claude tree (users symlink project dirs all the time).
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in filenames:
+                child = Path(dirpath) / name
+                if child.is_symlink():
+                    continue
+                if not child.is_file():
+                    continue
+                resolved = child.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                yield child
 
 
 def _inspect_rewrite_count(path: Path, mappings: Dict[str, Tuple[str, str]]) -> int:
@@ -345,7 +374,7 @@ def _rewrite_file_in_place(path: Path, mappings: Dict[str, Tuple[str, str]]) -> 
     updated_text, change_count = outcome
     if change_count <= 0:
         return
-    path.write_text(updated_text, encoding="utf-8")
+    atomic_write_text(path, updated_text)
 
 
 def _transform_file(path: Path, mappings: Dict[str, Tuple[str, str]]) -> Optional[Tuple[str, int]]:
